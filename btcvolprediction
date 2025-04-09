@@ -1,0 +1,176 @@
+import os
+import gc
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from scipy.interpolate import CubicSpline
+from xgboost import XGBRegressor
+from sklearn.metrics import mean_squared_error
+from sklearn.model_selection import TimeSeriesSplit, train_test_split, ParameterGrid
+
+# Define data paths
+BASE_PATH = r"C:\\Users\\wenbo\\OneDrive\\Desktop\\Minutedata"
+SENTIMENT_PATH = os.path.join(BASE_PATH, "FearandGreed.xlsx")
+
+# Load data
+spot_df = pd.read_parquet(os.path.join(BASE_PATH, "spot_btc_ohlcv_binance_minute_data.parquet"))
+funding_df = pd.read_parquet(os.path.join(BASE_PATH, "perp_btc_funding_binance_minute_data.parquet"))
+oi_df = pd.read_parquet(os.path.join(BASE_PATH, "perp_btc_OI_binance_minute_data.parquet"))
+
+# Convert data types and timestamps
+for df in [spot_df, funding_df, oi_df]:
+    df[df.select_dtypes(include='float64').columns] = df.select_dtypes(include='float64').astype('float32')
+    df['received_time'] = pd.to_datetime(df['received_time'])
+    df.drop_duplicates('received_time', inplace=True)
+
+# Resample OI data
+oi_df.set_index('received_time', inplace=True)
+oi_df = oi_df.resample('1min').ffill().reset_index()
+
+# Sort all dataframes
+spot_df.sort_values('received_time', inplace=True)
+funding_df.sort_values('received_time', inplace=True)
+oi_df.sort_values('received_time', inplace=True)
+
+# Merge in chunks
+chunk_size = 500_000
+merged_chunks = []
+for start in range(0, len(spot_df), chunk_size):
+    end = min(start + chunk_size, len(spot_df))
+    spot_chunk = spot_df.iloc[start:end].copy()
+    chunk = pd.merge_asof(spot_chunk, funding_df, on='received_time', tolerance=pd.Timedelta('1min'))
+    chunk = pd.merge_asof(chunk, oi_df, on='received_time', tolerance=pd.Timedelta('1min'))
+    merged_chunks.append(chunk)
+
+data = pd.concat(merged_chunks, ignore_index=True)
+del spot_df, funding_df, oi_df, merged_chunks
+gc.collect()
+
+# Clean up columns
+cols_to_drop = ['predicted_rate', 'origin_time_x', 'next_funding_time', 'index_price']
+data.drop(columns=cols_to_drop, inplace=True, errors='ignore')
+
+# Aggregate to hourly data
+data.set_index('received_time', inplace=True)
+data_hourly = data.resample('1h').agg({
+    'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last',
+    'volume': 'sum', 'rate': 'last', 'open_interest': 'last'
+})
+
+# Compute ATR (14h)
+data_hourly['tr1'] = data_hourly['high'] - data_hourly['low']
+data_hourly['tr2'] = abs(data_hourly['high'] - data_hourly['close'].shift(1))
+data_hourly['tr3'] = abs(data_hourly['low'] - data_hourly['close'].shift(1))
+data_hourly['true_range'] = data_hourly[['tr1', 'tr2', 'tr3']].max(axis=1)
+data_hourly['atr_14'] = data_hourly['true_range'].rolling(28).mean()
+data_hourly.drop(columns=['tr1', 'tr2', 'tr3', 'true_range'], inplace=True)
+
+# Feature engineering
+data_hourly['return'] = data_hourly['close'].pct_change()
+data_hourly['realized_vol'] = data_hourly['return'].rolling(24).std() * np.sqrt(24)
+data_hourly['lag_vol'] = data_hourly['realized_vol'].shift(1)
+
+# Load and process sentiment data
+sentiment_df = pd.read_excel(SENTIMENT_PATH)
+sentiment_df['Date'] = pd.to_datetime(sentiment_df['Date'], dayfirst=True)
+sentiment_df['Index'] = sentiment_df['Index'].shift(1)
+sentiment_df.dropna(inplace=True)
+sentiment_df.set_index('Date', inplace=True)
+sentiment_hourly = sentiment_df.resample('1h').ffill()
+
+# Merge sentiment
+data_hourly = data_hourly.merge(sentiment_hourly[['Index']], left_index=True, right_index=True, how='left').ffill()
+
+# Cubic spline for sentiment
+timestamps = sentiment_hourly.index.astype(np.int64)
+cs = CubicSpline(timestamps, sentiment_hourly['Index'])
+data_hourly['Sentiment_Spline'] = cs(data_hourly.index.astype(np.int64)).clip(sentiment_hourly['Index'].min(), sentiment_hourly['Index'].max())
+
+# Technical indicators
+final_df = data_hourly.copy()
+final_df['ema_price_short'] = final_df['close'].ewm(span=20).mean()
+final_df['ema_price_long'] = final_df['close'].ewm(span=60).mean()
+final_df['ema_volume'] = final_df['volume'].ewm(span=10).mean()
+
+for prefix, series in zip(['vol', 'price', 'volume'], ['realized_vol', 'close', 'volume']):
+    mean = final_df[series].rolling(10).mean()
+    std = final_df[series].rolling(10).std()
+    scale = 2 if prefix != 'volume' else 3.5
+    final_df[f'{prefix}_boll_upper'] = mean + scale * std
+    final_df[f'{prefix}_boll_lower'] = mean - scale * std
+    final_df[f'{prefix}_boll_width'] = 2 * std * scale
+
+# Lag features to avoid look-ahead bias
+lag_features = [
+    'ema_price_short', 'ema_price_long', 'ema_volume',
+    'vol_boll_upper', 'vol_boll_lower', 'vol_boll_width',
+    'price_boll_upper', 'price_boll_lower', 'price_boll_width',
+    'volume_boll_upper', 'volume_boll_lower', 'volume_boll_width',
+    'Sentiment_Spline', 'atr_14'
+]
+final_df[lag_features] = final_df[lag_features].shift(1)
+final_df.dropna(inplace=True)
+
+# Define features and target
+X = final_df[lag_features + ['lag_vol']]
+y = final_df['realized_vol']
+
+# Train/validation split
+X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.3, shuffle=False)
+
+# Model hyperparameters
+param_grid = ParameterGrid({
+    'learning_rate': [0.1],
+    'max_depth': [3],
+    'n_estimators': [300],
+    'reg_alpha': [0.1],
+    'reg_lambda': [10],
+    'subsample': [0.5]
+})
+
+# Time series cross-validation
+tscv = TimeSeriesSplit(n_splits=5)
+best_rmse, best_params = float('inf'), None
+
+for params in param_grid:
+    print(f"Testing: {params}")
+    fold_rmse = []
+    for train_idx, test_idx in tscv.split(X_train):
+        model = XGBRegressor(objective='reg:squarederror', tree_method='hist', eval_metric='rmse', early_stopping_rounds=50, **params)
+        model.fit(X_train.iloc[train_idx], y_train.iloc[train_idx], eval_set=[(X_train.iloc[test_idx], y_train.iloc[test_idx])], verbose=False)
+        preds = model.predict(X_train.iloc[test_idx])
+        fold_rmse.append(np.sqrt(mean_squared_error(y_train.iloc[test_idx], preds)))
+    avg_rmse = np.mean(fold_rmse)
+    if avg_rmse < best_rmse:
+        best_rmse, best_params = avg_rmse, params
+
+# Final model training
+final_model = XGBRegressor(objective='reg:squarederror', tree_method='hist', eval_metric='rmse', early_stopping_rounds=50, **best_params)
+final_model.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=True)
+
+# Final evaluation
+train_rmse = np.sqrt(mean_squared_error(y_train, final_model.predict(X_train)))
+val_rmse = np.sqrt(mean_squared_error(y_val, final_model.predict(X_val)))
+print(f"Train RMSE: {train_rmse:.6f}, Validation RMSE: {val_rmse:.6f}")
+
+# Feature importance
+importance_df = pd.DataFrame({
+    'Feature': X.columns,
+    'Importance': final_model.feature_importances_
+}).sort_values(by='Importance', ascending=False)
+print(importance_df)
+
+# Plot predictions
+plt.figure(figsize=(14, 7))
+plt.plot(y_val.index, y_val, label='Actual')
+plt.plot(y_val.index, final_model.predict(X_val), label='Predicted')
+plt.title('Actual vs Predicted Volatility (Hourly BTC)')
+plt.xlabel('Date')
+plt.ylabel('Realized Volatility')
+plt.xticks(rotation=45)
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+plt.savefig(os.path.join(BASE_PATH, 'actual_vs_predicted_volatility.png'))
