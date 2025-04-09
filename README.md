@@ -16,3 +16,5 @@ Dependencies:
 - matplotlib
 - scipy
 - scikit-learn
+
+Of note: This script is not appropriate to use for vol prediction when trading options because of how this model calculates volatility. However, it can serve as a frame of reference of expected directional volatility. 
